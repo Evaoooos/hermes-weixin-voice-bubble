@@ -45,6 +45,7 @@ VENV_PIP = HERMES_REPO / "venv" / "bin" / "pip"
 WEIXIN = HERMES_REPO / "gateway" / "platforms" / "weixin.py"
 QQBOT = HERMES_REPO / "gateway" / "platforms" / "qqbot" / "adapter.py"
 SENDTOOL = HERMES_REPO / "tools" / "send_message_tool.py"
+RUNPY = HERMES_REPO / "gateway" / "run.py"
 ENCODER = HERMES_HOME / "bin" / "silk_v3_encoder"
 SILK_REPO = os.environ.get("SILK_V3_REPO", "https://github.com/areCodeOI/silk-v3-encoder.git")
 
@@ -708,7 +709,71 @@ def patch_sendtool() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. verify
+# 6. gateway/run.py — auto-append ALL of this turn's TTS media tags
+# ---------------------------------------------------------------------------
+
+RUNPY_OLD_APPEND = '''            if "MEDIA:" not in final_response:
+                media_tags, has_voice_directive = _collect_auto_append_media_tags(
+                    result.get("messages", []),
+                    history_offset=len(agent_history),
+                    history_media_paths=_history_media_paths,
+                )
+
+                if media_tags:
+                    seen = set()
+                    unique_tags = []
+                    for tag in media_tags:
+                        if tag not in seen:
+                            seen.add(tag)
+                            unique_tags.append(tag)
+                    if has_voice_directive:
+                        unique_tags.insert(0, "[[audio_as_voice]]")
+                    final_response = final_response + "\\n" + "\\n".join(unique_tags)'''
+
+RUNPY_NEW_APPEND = '''            # Always collect this turn's producer-tool media and append any
+            # tag the model omitted. The old gate ("MEDIA:" not in
+            # final_response) skipped auto-append entirely when the model
+            # cited only ONE of several TTS results, silently dropping the
+            # other voices in multi-voice-bubble replies.
+            media_tags, has_voice_directive = _collect_auto_append_media_tags(
+                result.get("messages", []),
+                history_offset=len(agent_history),
+                history_media_paths=_history_media_paths,
+            )
+            if media_tags:
+                seen = set()
+                unique_tags = []
+                for tag in media_tags:
+                    tag_path = tag.split("MEDIA:", 1)[1].strip()
+                    if tag not in seen and tag_path not in final_response:
+                        seen.add(tag)
+                        unique_tags.append(tag)
+                if unique_tags:
+                    if has_voice_directive and "[[audio_as_voice]]" not in final_response:
+                        unique_tags.insert(0, "[[audio_as_voice]]")
+                    final_response = final_response + "\\n" + "\\n".join(unique_tags)'''
+
+
+def patch_runpy() -> None:
+    if not RUNPY.exists():
+        fail(f"run.py not found: {RUNPY}")
+        return
+    text = RUNPY.read_text()
+    if 'tag_path = tag.split("MEDIA:", 1)[1].strip()' in text:
+        log("run.py already patched")
+        return
+    if RUNPY_OLD_APPEND in text:
+        backup(RUNPY)
+        RUNPY.write_text(text.replace(RUNPY_OLD_APPEND, RUNPY_NEW_APPEND, 1))
+        log("patched run.py (auto-append all TTS media tags)")
+    elif "_collect_auto_append_media_tags" in text:
+        fail("run.py: auto-append block drifted — patch manually (see docs)")
+    else:
+        log("run.py has no auto-append mechanism — skipping (very old Hermes)")
+
+
+# ---------------------------------------------------------------------------
+# 7. verify
 # ---------------------------------------------------------------------------
 
 def verify() -> None:
@@ -744,6 +809,7 @@ def main() -> None:
     patch_weixin()
     patch_qqbot()
     patch_sendtool()
+    patch_runpy()
     verify()
     if FAILURES:
         print("\n[voice-bubble] finished WITH FAILURES:")
