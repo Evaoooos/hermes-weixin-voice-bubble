@@ -742,16 +742,30 @@ RUNPY_NEW_APPEND = '''            # Always collect this turn's producer-tool med
             )
             if media_tags:
                 seen = set()
-                unique_tags = []
+                ordered_tags = []
                 for tag in media_tags:
-                    tag_path = tag.split("MEDIA:", 1)[1].strip()
-                    if tag not in seen and tag_path not in final_response:
+                    if tag not in seen:
                         seen.add(tag)
-                        unique_tags.append(tag)
-                if unique_tags:
+                        ordered_tags.append(tag)
+                missing = [
+                    tag for tag in ordered_tags
+                    if tag.split("MEDIA:", 1)[1].strip() not in final_response
+                ]
+                if missing:
+                    # Strip the tags the model did cite and re-append the FULL
+                    # list in tool-call order, so multi-voice replies play in
+                    # generation order instead of "the model's one first, the
+                    # omitted ones after".
+                    for tag in ordered_tags:
+                        tag_path = tag.split("MEDIA:", 1)[1].strip()
+                        final_response = re.sub(
+                            r"[ \\t]*MEDIA:\\s*" + re.escape(tag_path) + r"[ \\t]*\\n?",
+                            "",
+                            final_response,
+                        )
                     if has_voice_directive and "[[audio_as_voice]]" not in final_response:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\\n" + "\\n".join(unique_tags)'''
+                        ordered_tags.insert(0, "[[audio_as_voice]]")
+                    final_response = final_response.rstrip() + "\\n" + "\\n".join(ordered_tags)'''
 
 
 def patch_runpy() -> None:
@@ -759,7 +773,7 @@ def patch_runpy() -> None:
         fail(f"run.py not found: {RUNPY}")
         return
     text = RUNPY.read_text()
-    if 'tag_path = tag.split("MEDIA:", 1)[1].strip()' in text:
+    if "ordered_tags" in text:
         log("run.py already patched")
         return
     if RUNPY_OLD_APPEND in text:
