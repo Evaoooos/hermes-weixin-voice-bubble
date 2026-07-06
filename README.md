@@ -6,28 +6,29 @@
 
 ## ⚡ v2（推荐 / Recommended）
 
-**v2 同时支持微信 + QQ 原生语音气泡，以及一次回复多条语音气泡（类真人聊天）**，并适配了 2026-06 之后的新版 Hermes（新版把微信 `send_voice` 硬编码成了文件附件回退，v1 脚本的锚点全部失效）。
+**v2 实现 QQ 原生语音气泡 + 一次回复多条语音气泡（类真人聊天），已真机验证**；微信端提供可播放的 MP3 文件兜底，气泡管线完整保留在 `WEIXIN_NATIVE_VOICE=1` 开关后面（原因见下）。适配 2026-06 之后的新版 Hermes（v1 脚本的锚点已全部失效）。
 
 ```bash
 python3 scripts/install_voice_bubble_v2.py
 hermes gateway restart   # 在普通 shell 里执行，不要在聊天里让 AI 重启
 ```
 
-v2 修的三个层面：
+v2 修的四个层面：
 
-1. **微信气泡**（`gateway/platforms/weixin.py`）：MP3 → Tencent SILK v3 → 原生语音气泡（`encode_type=6` / `sample_rate=24000` / `playtime=毫秒`，缺 playtime 会变成点不开的 `0秒` 气泡）。
-2. **QQ 气泡**（`gateway/platforms/qqbot/adapter.py`）：QQ 官方 API 的 `file_type=3` 只认 SILK，MP3 直接上传会降级成文件。v2 在发送前用 `pilk`（备选 `silk_v3_encoder`）转 SILK。
-3. **一次多条**（`send_message` 工具 + `send_weixin_direct`）：中途分条发送的音频原来在微信走文档、在 QQ 直接被丢弃——这就是"前几条是 MP3 文件，最后一条才是气泡"的原因。v2 让两个平台的分条发送都走 `send_voice`。
+1. **QQ 连接**（`gateway/platforms/qqbot/adapter.py`）：上游 bug——`connect()` 缺 `is_reconnect` 参数，QQ 网关根本连不上。
+2. **QQ 气泡**：QQ 官方 API 的 `file_type=3` 只认 SILK，MP3 直接上传会降级成文件。v2 在发送前用 `pilk`（备选 `silk_v3_encoder -tencent`）转 SILK。✅ 已验证：多条语音全部以气泡形式送达。
+3. **一次多条**（`send_message` 工具 + `send_weixin_direct`）：中途分条发送的音频原来在微信走文档、在 QQ 直接被丢弃——这就是"前几条是 MP3 文件，最后一条才是气泡"的原因。
+4. **微信媒体发送静默失败**：`_send_file` 原来不检查 iLink 业务返回码，媒体被服务端拒绝时无声无息。v2 补上检查和日志。
 
-详细补丁说明（供 AI 在上游代码再次变动、锚点失效时手工套用）见 [docs/VOICE_BUBBLE_SKILL_V2.md](docs/VOICE_BUBBLE_SKILL_V2.md)。
+**⚠️ 微信 bot 语音气泡的现状（2026-07 实测）**：即使发送与真实语音消息逐字节一致的 SILK 载荷和逐字段一致的 `voice_item`（encode_type=4、16kHz、playtime、无 encrypt_type、is_completed），iLink 服务端返回成功但**微信客户端不渲染**。Hermes 官方 2026-04 的原生语音尝试也因此撤回，腾讯自家 openclaw-weixin 插件只做了收不做发。结论：当前微信客户端不渲染 bot 语音消息，等腾讯放开后设置 `WEIXIN_NATIVE_VOICE=1` 即可切回气泡模式。完整排查记录见 [docs/VOICE_BUBBLE_SKILL_V2.md](docs/VOICE_BUBBLE_SKILL_V2.md)。
 
-让 AI 真正“像真人一样发多条语音”还需要提示词配合（写进 SOUL.md 或直接在聊天里要求）：
+让 AI 真正"像真人一样发多条语音"还需要提示词配合（写进 SOUL.md 或直接在聊天里要求）：
 
 > 语音回复时：把回复拆成多条简短口语化句子，每条分别调用 text_to_speech 生成音频，把所有 MEDIA: 标签都放进回复；不要合成一整条长音频。
 
-**v2 covers both Weixin and QQ native voice bubbles plus multi-bubble replies**, and works with post-2026-06 Hermes where the v1 anchors no longer match. Run `scripts/install_voice_bubble_v2.py`, restart the gateway, done. See [docs/VOICE_BUBBLE_SKILL_V2.md](docs/VOICE_BUBBLE_SKILL_V2.md) for the full patch spec (useful for AI-assisted manual patching when upstream drifts again).
+**v2: QQ native voice bubbles + multi-bubble replies (verified live); Weixin falls back to playable MP3 attachments because current WeChat clients do not render bot voice items** (full plumbing kept behind `WEIXIN_NATIVE_VOICE=1`; the investigation — byte-exact payload replica accepted by the server but never rendered — is documented in [docs/VOICE_BUBBLE_SKILL_V2.md](docs/VOICE_BUBBLE_SKILL_V2.md)).
 
-以下为 v1 文档（仅微信、旧版 Hermes）/ v1 docs below (Weixin only, older Hermes):
+以下为 v1 文档（历史参考；其"微信气泡成功"结论在当前微信客户端上已不可复现）/ v1 docs below (historical; its Weixin-bubble success no longer reproduces on current WeChat clients):
 
 ---
 

@@ -133,7 +133,9 @@ WEIXIN_HELPERS = '''
 # non-zero voice_item.playtime. Plain MP3/WAV/AMR payloads either render as
 # file attachments or produce an unplayable "0秒" bubble.
 SILK_ENCODER_PATH = get_hermes_home() / "bin" / "silk_v3_encoder"
-WEIXIN_VOICE_SAMPLE_RATE = 24000
+# Real WeChat hold-to-talk voice messages report sample_rate=16000 (verified
+# against a live inbound voice_item); the client player rejects other rates.
+WEIXIN_VOICE_SAMPLE_RATE = 16000
 
 
 def _convert_audio_to_weixin_silk(audio_path: str) -> Optional[str]:
@@ -220,10 +222,17 @@ def _probe_audio_duration_ms(path: str) -> Optional[int]:
 WEIXIN_SEND_VOICE_NEW = '''        if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
 
-        # Native voice bubbles need Tencent-compatible SILK v3. Convert first;
-        # only fall back to a file attachment when no SILK payload is possible
-        # (encoder missing or conversion failed).
-        silk_path = await asyncio.to_thread(_convert_audio_to_weixin_silk, audio_path)
+        # Native bot voice bubbles are currently NOT rendered by the WeChat
+        # client even though iLink accepts the message (verified 2026-07-06:
+        # payload and voice_item mirror a real inbound voice exactly, server
+        # returns ret=0, client shows nothing; upstream reverted its own
+        # native-voice attempt in Apr 2026 for the same reason). Default to
+        # the reliable file-attachment fallback; set WEIXIN_NATIVE_VOICE=1
+        # to re-enable the bubble path if Tencent turns rendering back on.
+        native_voice = os.getenv("WEIXIN_NATIVE_VOICE", "").strip() in {"1", "true", "yes"}
+        silk_path = None
+        if native_voice:
+            silk_path = await asyncio.to_thread(_convert_audio_to_weixin_silk, audio_path)
         try:
             if silk_path:
                 message_id = await self._send_file(
@@ -301,7 +310,10 @@ def patch_weixin() -> None:
             item_kwargs["bits_per_sample"] = 16
 '''
         new = '''        if media_type == MEDIA_VOICE and path.endswith(".silk"):
-            item_kwargs["encode_type"] = 6
+            # Real inbound WeChat voice reports encode_type=4 for its SILK
+            # payloads (the proto-comment enum saying 4=speex is wrong for
+            # iLink); mirror the client exactly.
+            item_kwargs["encode_type"] = 4
             item_kwargs["sample_rate"] = WEIXIN_VOICE_SAMPLE_RATE
             item_kwargs["bits_per_sample"] = 16
             # A zero playtime yields a "0秒" bubble that will not play even
@@ -314,6 +326,105 @@ def patch_weixin() -> None:
             text = text.replace(old, new, 1)
         else:
             fail("weixin.py: .silk voice_item block not found — patch manually")
+
+    # -- check the iLink response for media sendmessage (text path already
+    #    checks ret/errcode; without this, media rejections are silent)
+    if "iLink media sendmessage error" not in text:
+        old = '''        last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+        await _api_post(
+            self._send_session,
+            base_url=self._base_url,
+            endpoint=EP_SEND_MESSAGE,
+'''
+        new = '''        last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+        media_resp = await _api_post(
+            self._send_session,
+            base_url=self._base_url,
+            endpoint=EP_SEND_MESSAGE,
+'''
+        if old in text:
+            text = text.replace(old, new, 1)
+            old_ret = '''            token=self._token,
+            timeout_ms=API_TIMEOUT_MS,
+        )
+        return last_message_id
+
+    def _outbound_media_builder(self'''
+            new_ret = '''            token=self._token,
+            timeout_ms=API_TIMEOUT_MS,
+        )
+        # The text path checks ret/errcode; media must too, otherwise a
+        # server-side rejection (rate limit, invalid item) is silently
+        # swallowed and the file never reaches the user.
+        if isinstance(media_resp, dict):
+            ret = media_resp.get("ret")
+            errcode = media_resp.get("errcode")
+            if (ret not in (None, 0)) or (errcode not in (None, 0)):
+                raise RuntimeError(
+                    f"iLink media sendmessage error: ret={ret} errcode={errcode} "
+                    f"errmsg={media_resp.get('errmsg') or media_resp.get('msg')} "
+                    f"media_type={media_type}"
+                )
+        logger.info(
+            "[%s] media sendmessage accepted: type=%s file=%s",
+            self.name, media_type, Path(path).name,
+        )
+        return last_message_id
+
+    def _outbound_media_builder(self'''
+            if old_ret in text:
+                text = text.replace(old_ret, new_ret, 1)
+            else:
+                fail("weixin.py: media send return anchor not found")
+        else:
+            fail("weixin.py: media _api_post anchor not found")
+
+    # -- voice_item builder: mirror a real inbound voice item (no
+    #    encrypt_type — that is image semantics — plus completion metadata)
+    if '"is_completed": True' not in text:
+        old = '''            return MEDIA_VOICE, lambda **kw: {
+                "type": ITEM_VOICE,
+                "voice_item": {
+                    "media": {
+                        "encrypt_query_param": kw["encrypt_query_param"],
+                        "aes_key": kw["aes_key_for_api"],
+                        "encrypt_type": 1,
+                    },
+'''
+        new = '''            return MEDIA_VOICE, lambda **kw: {
+                "type": ITEM_VOICE,
+                # Real inbound voice items carry completion metadata; without
+                # it the client may treat the item as still streaming.
+                "is_completed": True,
+                "create_time_ms": int(time.time() * 1000),
+                "update_time_ms": int(time.time() * 1000),
+                "voice_item": {
+                    "media": {
+                        "encrypt_query_param": kw["encrypt_query_param"],
+                        "aes_key": kw["aes_key_for_api"],
+                    },
+'''
+        if old in text:
+            text = text.replace(old, new, 1)
+        else:
+            fail("weixin.py: voice_item builder block not found")
+
+    # -- upload via upload_param-constructed CDN URL (the path proven by
+    #    working implementations); upload_full_url only as fallback
+    old = '''        if upload_full_url:
+            upload_url = upload_full_url
+        elif upload_param:
+            upload_url = _cdn_upload_url(self._cdn_base_url, upload_param, filekey)
+'''
+    new = '''        if upload_param:
+            upload_url = _cdn_upload_url(self._cdn_base_url, upload_param, filekey)
+        elif upload_full_url:
+            upload_url = upload_full_url
+'''
+    if old in text:
+        text = text.replace(old, new, 1)
+    elif new not in text:
+        fail("weixin.py: upload URL priority block not found")
 
     # -- send_weixin_direct: route audio through send_voice (both loops)
     audio_branch = '''            elif is_voice or ext in {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac", ".silk"}:
@@ -450,6 +561,26 @@ def patch_qqbot() -> None:
             text = text.replace(QQ_SEND_VOICE_OLD, QQ_SEND_VOICE_NEW, 1)
         else:
             fail("qqbot/adapter.py: send_voice body not found — patch manually")
+
+    # -- upstream bug: gateway/run.py calls adapter.connect(is_reconnect=...)
+    #    but QQAdapter.connect() does not accept it, so QQ never connects.
+    if "async def connect(self, is_reconnect" not in text:
+        old = '''    async def connect(self) -> bool:
+        """Authenticate, obtain gateway URL, and open the WebSocket."""
+'''
+        new = '''    async def connect(self, is_reconnect: bool = False) -> bool:
+        """Authenticate, obtain gateway URL, and open the WebSocket.
+
+        ``is_reconnect`` is forwarded by the gateway runner for adapters that
+        distinguish cold boots from watcher reconnects; QQ handles both the
+        same way, the parameter just keeps the call signature compatible.
+        """
+        del is_reconnect
+'''
+        if old in text:
+            text = text.replace(old, new, 1)
+        else:
+            fail("qqbot/adapter.py: connect() signature anchor not found")
 
     if text != original:
         backup(QQBOT)
