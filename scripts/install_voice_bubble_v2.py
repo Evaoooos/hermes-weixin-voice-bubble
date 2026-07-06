@@ -562,6 +562,21 @@ def patch_qqbot() -> None:
         else:
             fail("qqbot/adapter.py: send_voice body not found — patch manually")
 
+    # -- older-upstream bug: rich-media message body used a per-kind key
+    #    ("voice"/"image"/...) but QQ API v2 only accepts "media"; voice
+    #    sends then fail with HTTP 500 "invalid file_info" and degrade to
+    #    file attachments. Current upstream already hardcodes "media".
+    old_media_key = '''            media_key = kind if kind in ("voice", "image", "video", "file") else "media"\n'''
+    if old_media_key in text:
+        text = text.replace(
+            old_media_key,
+            '''            # QQ API v2 expects the rich-media payload under "media" for every
+            # file_type; per-kind keys ("voice"/...) are rejected with
+            # "invalid file_info" (HTTP 500). Matches current upstream.
+            media_key = "media"\n''',
+            1,
+        )
+
     # -- upstream bug: gateway/run.py calls adapter.connect(is_reconnect=...)
     #    but QQAdapter.connect() does not accept it, so QQ never connects.
     if "async def connect(self, is_reconnect" not in text:
