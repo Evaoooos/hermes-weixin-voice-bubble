@@ -4,6 +4,33 @@
 
 ---
 
+## ⚡ v2（推荐 / Recommended）
+
+**v2 同时支持微信 + QQ 原生语音气泡，以及一次回复多条语音气泡（类真人聊天）**，并适配了 2026-06 之后的新版 Hermes（新版把微信 `send_voice` 硬编码成了文件附件回退，v1 脚本的锚点全部失效）。
+
+```bash
+python3 scripts/install_voice_bubble_v2.py
+hermes gateway restart   # 在普通 shell 里执行，不要在聊天里让 AI 重启
+```
+
+v2 修的三个层面：
+
+1. **微信气泡**（`gateway/platforms/weixin.py`）：MP3 → Tencent SILK v3 → 原生语音气泡（`encode_type=6` / `sample_rate=24000` / `playtime=毫秒`，缺 playtime 会变成点不开的 `0秒` 气泡）。
+2. **QQ 气泡**（`gateway/platforms/qqbot/adapter.py`）：QQ 官方 API 的 `file_type=3` 只认 SILK，MP3 直接上传会降级成文件。v2 在发送前用 `pilk`（备选 `silk_v3_encoder`）转 SILK。
+3. **一次多条**（`send_message` 工具 + `send_weixin_direct`）：中途分条发送的音频原来在微信走文档、在 QQ 直接被丢弃——这就是"前几条是 MP3 文件，最后一条才是气泡"的原因。v2 让两个平台的分条发送都走 `send_voice`。
+
+详细补丁说明（供 AI 在上游代码再次变动、锚点失效时手工套用）见 [docs/VOICE_BUBBLE_SKILL_V2.md](docs/VOICE_BUBBLE_SKILL_V2.md)。
+
+让 AI 真正“像真人一样发多条语音”还需要提示词配合（写进 SOUL.md 或直接在聊天里要求）：
+
+> 语音回复时：把回复拆成多条简短口语化句子，每条分别调用 text_to_speech 生成音频，把所有 MEDIA: 标签都放进回复；不要合成一整条长音频。
+
+**v2 covers both Weixin and QQ native voice bubbles plus multi-bubble replies**, and works with post-2026-06 Hermes where the v1 anchors no longer match. Run `scripts/install_voice_bubble_v2.py`, restart the gateway, done. See [docs/VOICE_BUBBLE_SKILL_V2.md](docs/VOICE_BUBBLE_SKILL_V2.md) for the full patch spec (useful for AI-assisted manual patching when upstream drifts again).
+
+以下为 v1 文档（仅微信、旧版 Hermes）/ v1 docs below (Weixin only, older Hermes):
+
+---
+
 ## 中文说明
 
 这是给 Hermes Agent 的微信 / Weixin 网关用的原生语音气泡补丁。
